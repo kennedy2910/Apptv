@@ -2,10 +2,12 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AppState, ChannelKind, ContentType, Channel, PlaylistItem, ContentType as CT, ChannelKind as CK } from './types';
 import { MOCK_CHANNELS, OVERLAY_TIMEOUT, DEFAULT_EDGE_BASE_URL } from './constants';
+import { Gamepad2 } from 'lucide-react';
 import YouTubePlayer from './components/YouTubePlayer';
 import HLSPlayer from './components/HLSPlayer';
 import AdPlaceholder from './components/AdPlaceholder';
 import Overlay from './components/Overlay';
+import RetroHub from './components/RetroHub';
 
 const normalizeIconKey = (s: string) =>
   String(s || '')
@@ -47,6 +49,75 @@ const resolveChannelIconUrl = (channelName: string): string | undefined => {
   return k ? ICON_URL_BY_KEY[k] : undefined;
 };
 
+type CategoryId =
+  | 'esportes'
+  | 'musicas'
+  | 'kids'
+  | 'documentarios'
+  | 'filmes'
+  | 'religiosos'
+  | 'games'
+  | 'lives'
+  | 'noticias';
+
+const CATEGORIES: Array<{ id: CategoryId; label: string }> = [
+  { id: 'esportes', label: 'esportes' },
+  { id: 'musicas', label: 'musicas' },
+  { id: 'kids', label: 'kids' },
+  { id: 'documentarios', label: 'Documentarios' },
+  { id: 'filmes', label: 'filmes' },
+  { id: 'religiosos', label: 'religiosos' },
+  { id: 'games', label: 'games' },
+  { id: 'lives', label: 'Lives' },
+  { id: 'noticias', label: 'Noticias' },
+];
+
+const CHANNEL_CATEGORY_OVERRIDES: Record<string, CategoryId> = {
+  esportv: 'esportes',
+  nexflix: 'filmes',
+  cinenex: 'filmes',
+  nexomovies: 'filmes',
+  cineflux: 'filmes',
+  cinex: 'filmes',
+  nexcine: 'filmes',
+  variedades: 'lives',
+  telanova: 'noticias',
+};
+
+const guessCategoryFromName = (name: string): CategoryId => {
+  const k = normalizeIconKey(name);
+  if (/sport|esport|fut|nba|ufc/.test(k)) return 'esportes';
+  if (/music|musica|song|hits|mtv/.test(k)) return 'musicas';
+  if (/kids|infantil|cartoon|desenho/.test(k)) return 'kids';
+  if (/doc|document/.test(k)) return 'documentarios';
+  if (/film|movie|cine|flix|series|tv/.test(k)) return 'filmes';
+  if (/relig|gospel|igreja|jesus|fe/.test(k)) return 'religiosos';
+  if (/game|retro|arcade|ps|xbox|nintendo/.test(k)) return 'games';
+  if (/live|lives|ao vivo|stream/.test(k)) return 'lives';
+  if (/news|notic|jornal|tvnews/.test(k)) return 'noticias';
+  return 'filmes';
+};
+
+const getChannelCategory = (ch: Channel): CategoryId => {
+  const key = normalizeIconKey(ch.name);
+  return CHANNEL_CATEGORY_OVERRIDES[key] || guessCategoryFromName(ch.name);
+};
+
+const getVisibleChannelIndices = (channels: Channel[], category: CategoryId): number[] => {
+  const idxs = channels
+    .map((ch, i) => ({ ch, i }))
+    .filter(x => getChannelCategory(x.ch) === category)
+    .map(x => x.i);
+  return idxs.length ? idxs : channels.map((_, i) => i);
+};
+
+const TOP_APPS: Array<{ id: string; label: string; href: string; kind: 'pill' | 'brand' }> = [
+  { id: 'spotify', label: 'Spotify', href: 'https://open.spotify.com/', kind: 'pill' },
+  { id: 'youtube', label: 'YouTube', href: 'https://www.youtube.com/', kind: 'brand' },
+  { id: 'prime', label: 'prime video', href: 'https://www.primevideo.com/', kind: 'brand' },
+  { id: 'netflix', label: 'NETFLIX', href: 'https://www.netflix.com/', kind: 'brand' },
+];
+
 const App: React.FC = () => {
   const DEBUG = Boolean((import.meta as any).env?.DEV);
 
@@ -64,6 +135,8 @@ const App: React.FC = () => {
   const channelRailRef = useRef<HTMLDivElement | null>(null);
   const frozenOffsetRef = useRef<{ key: string; offset: number } | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [selectedCategory, setSelectedCategory] = useState<CategoryId>('esportes');
+  const [isRetroOpen, setIsRetroOpen] = useState(false);
   const [ytTitleByUrl, setYtTitleByUrl] = useState<Record<string, string>>({});
   const [edgeBaseUrl, setEdgeBaseUrl] = useState<string>(
     (import.meta as any).env?.VITE_EDGE_BASE_URL || DEFAULT_EDGE_BASE_URL
@@ -419,21 +492,19 @@ const App: React.FC = () => {
 
     setTimeout(() => {
       setState(prev => {
-        let nextIndex = direction === 'up' 
-          ? prev.currentChannelIndex - 1 
-          : prev.currentChannelIndex + 1;
-
-        if (nextIndex < 0) nextIndex = prev.channels.length - 1;
-        if (nextIndex >= prev.channels.length) nextIndex = 0;
-
-        return { ...prev, currentChannelIndex: nextIndex };
+        const visible = getVisibleChannelIndices(prev.channels, selectedCategory);
+        const curPos = Math.max(0, visible.indexOf(prev.currentChannelIndex));
+        let nextPos = direction === 'up' ? curPos - 1 : curPos + 1;
+        if (nextPos < 0) nextPos = visible.length - 1;
+        if (nextPos >= visible.length) nextPos = 0;
+        return { ...prev, currentChannelIndex: visible[nextPos] };
       });
 
       setTimeout(() => {
         setIsZapping(false);
       }, 150);
     }, 300);
-  }, [isZapping, resetOverlayTimer]);
+  }, [isZapping, resetOverlayTimer, selectedCategory]);
 
   const scrollChannelRail = useCallback((dir: -1 | 1) => {
     const el = channelRailRef.current;
@@ -459,6 +530,7 @@ const App: React.FC = () => {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!state.isInteracted) return;
+      if (isRetroOpen) return; // Let RetroHub/emulator own the remote while open.
 
       const code = (e as any).keyCode as number | undefined;
       const isOk =
@@ -507,7 +579,7 @@ const App: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [changeChannel, isFullscreen, resetOverlayTimer, scrollChannelRail, state.isInteracted]);
+  }, [changeChannel, isFullscreen, isRetroOpen, resetOverlayTimer, scrollChannelRail, state.isInteracted]);
 
   useEffect(() => {
     if (state.isInteracted) {
@@ -568,6 +640,8 @@ const App: React.FC = () => {
 
   const currentChannel = state.channels[state.currentChannelIndex];
   const playback = getLivePlaybackState(currentChannel);
+  const visibleChannelIndices = getVisibleChannelIndices(state.channels, selectedCategory);
+  const visibleChannelPos = Math.max(0, visibleChannelIndices.indexOf(state.currentChannelIndex));
 
   if (!playback) {
     return (
@@ -607,9 +681,47 @@ const App: React.FC = () => {
           <div className="w-10 h-10 rounded-2xl bg-sky-500/90 grid place-items-center text-slate-950 font-black">N</div>
           <div className="font-extrabold tracking-tight">NEX TV</div>
         </div>
-        <div className="hidden md:flex items-center gap-8 text-sm text-slate-300">
-          <span>Guia de canais</span>
-          <span>On Demand</span>
+        <div className="hidden md:flex items-center gap-4 text-sm text-slate-300 min-w-0">
+          <div className="flex items-center gap-3">
+            {TOP_APPS.map(app => (
+              <a
+                key={app.id}
+                href={app.href}
+                target="_blank"
+                rel="noreferrer"
+                className={[
+                  'select-none rounded-xl border border-white/10 hover:bg-white/10 transition-colors',
+                  app.kind === 'pill' ? 'px-4 py-2 bg-black/30 font-semibold' : 'px-3 py-2 bg-black/40 font-extrabold tracking-tight',
+                ].join(' ')}
+              >
+                <span
+                  className={[
+                    app.id === 'spotify' ? 'text-emerald-400' : '',
+                    app.id === 'youtube' ? 'text-red-500' : '',
+                    app.id === 'prime' ? 'text-sky-400' : '',
+                    app.id === 'netflix' ? 'text-red-600' : '',
+                  ].join(' ')}
+                >
+                  {app.label}
+                </span>
+              </a>
+            ))}
+
+            <button
+              type="button"
+              onClick={() => setIsRetroOpen(true)}
+              className="select-none rounded-xl border border-white/10 bg-black/30 hover:bg-white/10 transition-colors px-3 py-2 flex items-center gap-2"
+              aria-label="Abrir Retro Games"
+              title="Retro Games"
+            >
+              <Gamepad2 className="w-4 h-4 text-fuchsia-300" />
+              <span className="font-extrabold tracking-tight text-slate-100">Retro</span>
+            </button>
+          </div>
+          <div className="flex items-center gap-8 pl-2">
+            <span>Guia de canais</span>
+            <span>On Demand</span>
+          </div>
         </div>
         <div className="min-w-[260px] flex justify-end">
           <button
@@ -631,6 +743,34 @@ const App: React.FC = () => {
           </p>
           <div className="mt-5 text-xs text-slate-400">
             Enter/OK: fullscreen do player
+          </div>
+
+          <div className="mt-10">
+            <div className="text-sm font-semibold text-slate-200 mb-3">Categorias</div>
+            <div className="grid grid-cols-3 gap-2">
+              {CATEGORIES.map(cat => (
+                <button
+                  key={cat.id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedCategory(cat.id);
+                    resetOverlayTimer();
+                    setState(prev => {
+                      const idx = prev.channels.findIndex(ch => getChannelCategory(ch) === cat.id);
+                      return idx >= 0 ? { ...prev, currentChannelIndex: idx } : prev;
+                    });
+                  }}
+                  className={[
+                    'h-16 rounded-xl border text-sm font-bold tracking-tight transition-all',
+                    selectedCategory === cat.id
+                      ? 'border-sky-400/70 bg-sky-500/10 text-slate-50 ring-2 ring-sky-400/60'
+                      : 'border-white/10 bg-white/5 text-slate-200 hover:bg-white/10',
+                  ].join(' ')}
+                >
+                  {cat.label}
+                </button>
+              ))}
+            </div>
           </div>
         </section>
 
@@ -656,12 +796,14 @@ const App: React.FC = () => {
                         offset={frozenOffset}
                         duration={currentContent.duration}
                         onEnded={handleItemEnd}
+                        muted={isRetroOpen}
                       />
                     ) : (
                       <HLSPlayer
                         url={currentContent.url!}
                         offset={frozenOffset}
                         onEnded={handleItemEnd}
+                        muted={isRetroOpen}
                       />
                     )}
                   </>
@@ -671,8 +813,8 @@ const App: React.FC = () => {
               <Overlay
                 channel={currentChannel}
                 isVisible={state.isOverlayVisible}
-                channelIndex={state.currentChannelIndex}
-                totalChannels={state.channels.length}
+                channelIndex={visibleChannelPos}
+                totalChannels={visibleChannelIndices.length}
                 nextItem={nextItem}
                 variant={isFullscreen ? 'fullscreen' : 'card'}
               />
@@ -706,7 +848,8 @@ const App: React.FC = () => {
                 ref={channelRailRef}
                 className="flex flex-nowrap gap-3 overflow-x-auto overflow-y-hidden pb-2 px-2 snap-x snap-mandatory scroll-smooth overscroll-x-contain min-w-0"
               >
-                {state.channels.map((ch, idx) => {
+                {visibleChannelIndices.map((chIdx) => {
+                  const ch = state.channels[chIdx];
                   const iconUrl = resolveChannelIconUrl(ch.name);
                   const fallbackLetter = String(ch.name || '?').trim().slice(0, 1).toUpperCase() || '?';
 
@@ -714,10 +857,10 @@ const App: React.FC = () => {
                     <div
                       key={ch.channel_id}
                       data-channel-card="1"
-                      data-channel-idx={idx}
+                      data-channel-idx={chIdx}
                       className={[
                         'shrink-0 w-56 rounded-2xl border bg-white/5 border-white/10 overflow-hidden snap-start',
-                        idx === state.currentChannelIndex ? 'ring-2 ring-sky-400/70' : '',
+                        chIdx === state.currentChannelIndex ? 'ring-2 ring-sky-400/70' : '',
                       ].join(' ')}
                     >
                       <div className="h-28 bg-gradient-to-br from-white/10 to-white/0 relative">
@@ -769,8 +912,14 @@ const App: React.FC = () => {
               {currentChannel.kind === ChannelKind.YOUTUBE_LINEAR ? 'Baseado em schedule_start + duracoes.' : 'Canal ao vivo.'}
             </div>
           </div>
+
         </aside>
       </main>
+
+      <RetroHub
+        isOpen={isRetroOpen}
+        onClose={() => setIsRetroOpen(false)}
+      />
     </div>
   );
 };

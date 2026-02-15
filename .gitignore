@@ -12,6 +12,18 @@ dist
 dist-ssr
 *.local
 
+# Local ROMs (keep docs, ignore binaries)
+roms/**
+!roms/
+!roms/covers/
+!roms/README.md
+!roms/covers/README.md
+Roms/**
+!Roms/
+!Roms/covers/
+!Roms/README.md
+!Roms/covers/README.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
