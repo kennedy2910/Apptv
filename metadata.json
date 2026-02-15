@@ -1,0 +1,5 @@
+{
+  "name": "LinearTV Pro",
+  "description": "A high-end linear TV application simulating live broadcasting with YouTube and HLS streams, optimized for mobile and Android TV.",
+  "requestFramePermissions": []
+}
