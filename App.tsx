@@ -1,7 +1,7 @@
 ﻿
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AppState, ChannelKind, ContentType, Channel, PlaylistItem, ContentType as CT, ChannelKind as CK } from './types';
-import { MOCK_CHANNELS, OVERLAY_TIMEOUT, DEFAULT_EDGE_BASE_URL } from './constants';
+import { MOCK_CHANNELS, OVERLAY_TIMEOUT } from './constants';
 import { Gamepad2 } from 'lucide-react';
 import YouTubePlayer from './components/YouTubePlayer';
 import HLSPlayer from './components/HLSPlayer';
@@ -138,8 +138,9 @@ const App: React.FC = () => {
   const [selectedCategory, setSelectedCategory] = useState<CategoryId>('esportes');
   const [isRetroOpen, setIsRetroOpen] = useState(false);
   const [ytTitleByUrl, setYtTitleByUrl] = useState<Record<string, string>>({});
+  const configuredEdgeBaseUrl = String((import.meta as any).env?.VITE_EDGE_BASE_URL || '').trim().replace(/\/+$/, '');
   const [edgeBaseUrl, setEdgeBaseUrl] = useState<string>(
-    (import.meta as any).env?.VITE_EDGE_BASE_URL || DEFAULT_EDGE_BASE_URL
+    configuredEdgeBaseUrl
   );
   const [edgeResolvedName, setEdgeResolvedName] = useState<string>('');
   const EDGE_BASE_URL = edgeBaseUrl;
@@ -148,27 +149,40 @@ const App: React.FC = () => {
   // Load channels from EDGE
   // -------------------------
   const RESOLVE_URL = (import.meta as any).env?.VITE_RESOLVE_URL as string | undefined;
+  const ALLOW_EDGE_RESOLVE = (import.meta as any).env?.VITE_ALLOW_EDGE_RESOLVE === '1';
 
   const normalizeBaseUrl = (u: string) => String(u || '').trim().replace(/\/+$/, '');
 
   const isLocalhostUrl = (u: string) => {
     try {
       const h = new URL(u).hostname;
-      return h === 'localhost' || h === '127.0.0.1';
+      return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+    } catch {
+      return false;
+    }
+  };
+
+  const isAllowedEdgeBaseUrl = (u: string) => {
+    try {
+      const parsed = new URL(u);
+      const proto = parsed.protocol;
+      if (proto !== 'http:' && proto !== 'https:') return false;
+      if (isLocalhostUrl(u)) return false;
+      return true;
     } catch {
       return false;
     }
   };
 
   const resolveEdgeBaseUrl = useCallback(async () => {
-    if (!RESOLVE_URL) return;
+    if (!ALLOW_EDGE_RESOLVE || !RESOLVE_URL || configuredEdgeBaseUrl) return;
 
     const cacheKey = 'nex_resolve_cache_v1';
     try {
       const raw = localStorage.getItem(cacheKey);
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (parsed?.base_url && parsed?.expires_at && Date.now() < Number(parsed.expires_at)) {
+        if (parsed?.base_url && parsed?.expires_at && Date.now() < Number(parsed.expires_at) && isAllowedEdgeBaseUrl(String(parsed.base_url))) {
           setEdgeResolvedName(String(parsed.edge_name || parsed.edge_id || ''));
           setEdgeBaseUrl(normalizeBaseUrl(String(parsed.base_url)));
           if (DEBUG) {
@@ -201,12 +215,9 @@ const App: React.FC = () => {
       const fallbacks = Array.isArray(data?.fallback_edges) ? data.fallback_edges : [];
       const fallbackBase = fallbacks
         .map((x: any) => normalizeBaseUrl(String(x?.base_url || x?.baseUrl || '')))
-        .find((x: string) => x && !isLocalhostUrl(x));
+        .find((x: string) => x && isAllowedEdgeBaseUrl(x));
 
-      // Avoid "localhost" answers when the client isn't on localhost.
-      const chosen =
-        (base && (!isLocalhostUrl(base) || window.location.hostname === 'localhost')) ? base :
-        (fallbackBase || base);
+      const chosen = isAllowedEdgeBaseUrl(base) ? base : (fallbackBase || '');
 
       if (!chosen) return;
 
@@ -235,7 +246,7 @@ const App: React.FC = () => {
     } finally {
       window.clearTimeout(t);
     }
-  }, [RESOLVE_URL]);
+  }, [ALLOW_EDGE_RESOLVE, RESOLVE_URL, configuredEdgeBaseUrl]);
 
   const toChannelFromEdge = (it: any): Channel | null => {
     const channelId = String(it.channel_id || it.channel_number || it.id || '').trim();
@@ -289,10 +300,15 @@ const App: React.FC = () => {
     try {
       setState(s => ({ ...s, isLoading: true }));
 
+      const base = normalizeBaseUrl(edgeBaseUrl);
+      if (!isAllowedEdgeBaseUrl(base)) {
+        throw new Error('Invalid EDGE base URL. Configure VITE_EDGE_BASE_URL (or resolver) with a valid EDGE URL (http/https, not localhost).');
+      }
+
       // Preferred endpoint: /playlist.json (can carry schedule + items)
       const urlsToTry = [
-        `${edgeBaseUrl.replace(/\/$/, '')}/playlist.json`,
-        `${edgeBaseUrl.replace(/\/$/, '')}/channels`,
+        `${base}/playlist.json`,
+        `${base}/channels`,
       ];
 
       let payload: any = null;
@@ -339,10 +355,12 @@ const App: React.FC = () => {
     // Resolve edge first (best-effort), then load channels.
     // If resolve fails, we keep the configured base.
     (async () => {
-      try { await resolveEdgeBaseUrl(); } catch {}
+      if (!configuredEdgeBaseUrl && ALLOW_EDGE_RESOLVE) {
+        try { await resolveEdgeBaseUrl(); } catch {}
+      }
       await loadChannelsFromEdge();
     })();
-  }, [loadChannelsFromEdge, resolveEdgeBaseUrl]);
+  }, [ALLOW_EDGE_RESOLVE, configuredEdgeBaseUrl, loadChannelsFromEdge, resolveEdgeBaseUrl]);
 
   // FunÃ§Ã£o auxiliar para calcular o estado atual da transmissÃ£o baseada no tempo real
   const getLivePlaybackState = (channel: Channel) => {

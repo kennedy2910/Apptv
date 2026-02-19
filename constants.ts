@@ -55,6 +55,3 @@ export const MOCK_CHANNELS: Channel[] = [
 ];
 
 export const OVERLAY_TIMEOUT = 5000;
-
-// Default Edge base URL (can be overridden via Vite env: VITE_EDGE_BASE_URL)
-export const DEFAULT_EDGE_BASE_URL = "http://localhost:9100";
