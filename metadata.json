@@ -1,5 +1,5 @@
-{
-  "name": "LinearTV Pro",
-  "description": "A high-end linear TV application simulating live broadcasting with YouTube and HLS streams, optimized for mobile and Android TV.",
+﻿{
+  "name": "NEXCAST.TV",
+  "description": "NEXCAST.TV: free FAST TV com canais infinitos para web, mobile e Android TV.",
   "requestFramePermissions": []
 }

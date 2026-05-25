@@ -1,5 +1,5 @@
-
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+﻿
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AppState, BannerAd, ChannelKind, ContentType, Channel, PlaylistItem, ContentType as CT, ChannelKind as CK } from './types';
 import { MOCK_CHANNELS } from './constants';
 import { Menu, Search, Mic, UserCircle2 } from 'lucide-react';
@@ -7,9 +7,8 @@ import YouTubePlayer from './components/YouTubePlayer';
 import HLSPlayer from './components/HLSPlayer';
 import AdPlaceholder from './components/AdPlaceholder';
 import BannerSticker from './components/BannerSticker';
-import { getBannerIntervalMs, getBannerOccurrenceWithPhase, getEdgeBannerAds } from './bannerAds';
+import { getBannerOccurrence, getEdgeBannerAds } from './bannerAds';
 import { BRAND_DESCRIPTION, BRAND_LOGO_SRC, BRAND_NAME, BRAND_TAGLINE } from './branding';
-import { getRuntimeResolveUrl, isNativeApp, shouldUseDirectEdgeUrls } from './nativeRuntime';
 
 const normalizeIconKey = (s: string) =>
   String(s || '')
@@ -85,16 +84,6 @@ type ExpandedSeekAnchor = {
   startedAtMs: number;
 };
 type AppMenuSection = 'termos' | 'sobre' | 'colabore';
-type TvFocusArea = 'search' | 'categories' | 'popular' | 'cards';
-
-const TV_AREA_GRAPH: Record<TvFocusArea, Partial<Record<'left' | 'right' | 'up' | 'down', TvFocusArea>>> = {
-  search: { left: 'categories', down: 'popular' },
-  categories: { right: 'cards', up: 'search', down: 'categories' },
-  popular: { left: 'categories', up: 'search', down: 'cards' },
-  cards: { left: 'categories', up: 'popular' },
-};
-
-const TV_GRID_COLUMNS = 3;
 
 const App: React.FC = () => {
   const DEBUG = Boolean((import.meta as any).env?.DEV);
@@ -119,20 +108,13 @@ const App: React.FC = () => {
   const [isExpandedInfoVisible, setIsExpandedInfoVisible] = useState(false);
   const [isAppMenuOpen, setIsAppMenuOpen] = useState(false);
   const [activeAppMenuSection, setActiveAppMenuSection] = useState<AppMenuSection>('termos');
-  const [focusedArea, setFocusedArea] = useState<TvFocusArea>('cards');
-  const [activeArea, setActiveArea] = useState<TvFocusArea | null>(null);
-  const [pulsedArea, setPulsedArea] = useState<TvFocusArea | null>('cards');
   const expandedInfoTimerRef = useRef<number | null>(null);
-  const expandedSeekBarRef = useRef<HTMLDivElement | null>(null);
-  const expandedSeekDragCleanupRef = useRef<(() => void) | null>(null);
+  const playbackAdvanceTimerRef = useRef<number | null>(null);
+  const seekHoldDelayTimerRef = useRef<number | null>(null);
+  const seekHoldRepeatTimerRef = useRef<number | null>(null);
+  const seekHoldTriggeredRef = useRef(false);
   const bannerAdTimerRef = useRef<number | null>(null);
   const bannerAdHideTimerRef = useRef<number | null>(null);
-  const focusAreaTimerRef = useRef<number | null>(null);
-  const autoEnterAreaTimerRef = useRef<number | null>(null);
-  const activeAreaRef = useRef<TvFocusArea | null>(null);
-  const areaBoundaryIntentRef = useRef<{ area: TvFocusArea; direction: 'left' | 'right' | 'up' | 'down' } | null>(null);
-  const expandedPlaybackRef = useRef<typeof expandedPlayback>(null);
-  const isAppMenuOpenRef = useRef(false);
   const [activeBannerAd, setActiveBannerAd] = useState<BannerAd | null>(null);
   const [isBannerAdVisible, setIsBannerAdVisible] = useState(false);
   const [ytTitleByUrl, setYtTitleByUrl] = useState<Record<string, string>>({});
@@ -140,16 +122,15 @@ const App: React.FC = () => {
   const configuredEdgeFallbackBaseUrl = String((import.meta as any).env?.VITE_EDGE_FALLBACK_BASE_URL || '').trim().replace(/\/+$/, '');
   const EDGE_PROXY_PREFIX = '/edge';
   const [edgeBaseUrl, setEdgeBaseUrl] = useState<string>(
-    configuredEdgeBaseUrl || configuredEdgeFallbackBaseUrl
+    configuredEdgeBaseUrl
   );
   const [edgeResolvedName, setEdgeResolvedName] = useState<string>('');
   const EDGE_BASE_URL = edgeBaseUrl;
-  const isTvBoxNavigation = isNativeApp();
 
   // -------------------------
   // Load channels from EDGE
   // -------------------------
-  const RESOLVE_URL = getRuntimeResolveUrl();
+  const RESOLVE_URL = (import.meta as any).env?.VITE_RESOLVE_URL as string | undefined;
   const ALLOW_EDGE_RESOLVE = (import.meta as any).env?.VITE_ALLOW_EDGE_RESOLVE === '1';
 
   const normalizeBaseUrl = (u: string) => String(u || '').trim().replace(/\/+$/, '');
@@ -183,7 +164,6 @@ const App: React.FC = () => {
       const parsed = new URL(normalized, window.location.origin);
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return normalized;
       if (parsed.origin === window.location.origin) return `${parsed.pathname}${parsed.search}${parsed.hash}`;
-      if (shouldUseDirectEdgeUrls()) return parsed.toString();
 
       const knownEdgeOrigins = new Set<string>();
       for (const candidate of [edgeBaseUrl, configuredEdgeBaseUrl, configuredEdgeFallbackBaseUrl]) {
@@ -329,48 +309,46 @@ const App: React.FC = () => {
     };
   };
 
+  const parseM3U = (text: string): Channel[] => {
+    const lines = text.split('\n');
+    const channels: Channel[] = [];
+    let currentName = '';
+    let currentCategory = '';
+
+    for (let line of lines) {
+      line = line.trim();
+      if (line.startsWith('#EXTINF')) {
+        // Extrai o nome do canal apos a virgula.
+        currentName = (line.split(',').pop() || 'Canal sem nome').trim();
+        const groupMatch = line.match(/(?:group-title|tvg-group|group|category)="([^"]+)"/i);
+        currentCategory = groupMatch?.[1]?.trim() || '';
+      } else if (line.startsWith('http')) {
+        const itemKind = isYouTubeUrl(line) ? CK.YOUTUBE_LINEAR : CK.HLS;
+        channels.push({
+          channel_id: Math.random().toString(36).substr(2, 9),
+          name: currentName,
+          category: currentCategory || undefined,
+          kind: itemKind,
+          schedule_start: new Date().toISOString(),
+          items: [{ type: CT.VIDEO, url: line, duration: 3600 }],
+          loop: true
+        });
+      }
+    }
+    return channels;
+  };
+  // Localize por volta da linha 245 e altere para:
   const loadChannelsFromEdge = useCallback(async () => {
     try {
       setState(s => ({ ...s, isLoading: true }));
 
-      const base = normalizeBaseUrl(edgeBaseUrl);
-      if (!isAllowedEdgeBaseUrl(base)) {
-        throw new Error('Invalid EDGE base URL. Configure VITE_EDGE_BASE_URL (or resolver) with a valid EDGE URL (http/https, not localhost).');
-      }
+      const response = await fetch('/playlist.json', { cache: 'no-store' });
+      if (!response.ok) throw new Error('Falha ao carregar playlist.json');
 
-      // Preferred endpoint: /playlist.json (can carry schedule + items)
-      const urlsToTry = [
-        toEdgeProxyUrl(`${base}/playlist.json`),
-        toEdgeProxyUrl(`${base}/channels`),
-      ];
-
-      let payload: any = null;
-      let lastErr: any = null;
-
-      for (const u of urlsToTry) {
-        try {
-          const r = await fetch(u, { cache: 'no-store' });
-          if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-          payload = await r.json();
-          if (DEBUG) console.info('[edge] ok', { url: u });
-          break;
-        } catch (e) {
-          lastErr = e;
-          if (DEBUG) console.info('[edge] fail', { url: u, error: String((e as any)?.message || e) });
-        }
-      }
-
-      if (!payload) throw lastErr || new Error('Failed to load');
-
-      // Normalize: payload can be {items:[...]} or direct array
+      const payload: any = await response.json();
       const rawList = Array.isArray(payload) ? payload : (payload.items || payload.channels || []);
-      const channels = (rawList as any[])
-        .map(toChannelFromEdge)
-        .filter(Boolean) as Channel[];
-
-      if (channels.length === 0) {
-        throw new Error('EDGE playlist returned 0 channels. Ensure EDGE exposes items/schedule for linear playback.');
-      }
+      const channels = (rawList as any[]).map(toChannelFromEdge).filter(Boolean) as Channel[];
+      if (!channels.length) throw new Error('EDGE playlist returned 0 channels');
 
       setState(s => ({
         ...s,
@@ -379,10 +357,10 @@ const App: React.FC = () => {
         isLoading: false,
       }));
     } catch (e) {
-      console.error('[LinearTV] Failed to load channels from EDGE. Falling back to MOCK_CHANNELS.', e);
-      setState(s => ({ ...s, channels: MOCK_CHANNELS, isLoading: false }));
+      console.error('[LinearTV] Failed to load playlist.json. Falling back to MOCK_CHANNELS.', e);
+      setState(s => ({ ...s, channels: MOCK_CHANNELS, currentChannelIndex: 0, isLoading: false }));
     }
-  }, [edgeBaseUrl, toEdgeProxyUrl]);
+  }, [toEdgeProxyUrl]);
 
   useEffect(() => {
     // Resolve edge first (best-effort), then load channels.
@@ -395,7 +373,7 @@ const App: React.FC = () => {
     })();
   }, [ALLOW_EDGE_RESOLVE, configuredEdgeBaseUrl, loadChannelsFromEdge, resolveEdgeBaseUrl]);
 
-  // FunÃƒÂ§ÃƒÂ£o auxiliar para calcular o estado atual da transmissÃƒÂ£o baseada no tempo real
+  // FunÃ§Ã£o auxiliar para calcular o estado atual da transmissÃ£o baseada no tempo real
   const clearBannerAdTimers = useCallback(() => {
     if (bannerAdTimerRef.current) {
       window.clearTimeout(bannerAdTimerRef.current);
@@ -404,6 +382,13 @@ const App: React.FC = () => {
     if (bannerAdHideTimerRef.current) {
       window.clearTimeout(bannerAdHideTimerRef.current);
       bannerAdHideTimerRef.current = null;
+    }
+  }, []);
+
+  const clearPlaybackAdvanceTimer = useCallback(() => {
+    if (playbackAdvanceTimerRef.current) {
+      window.clearTimeout(playbackAdvanceTimerRef.current);
+      playbackAdvanceTimerRef.current = null;
     }
   }, []);
   const getLivePlaybackState = (channel: Channel) => {
@@ -420,7 +405,7 @@ const App: React.FC = () => {
     if (channel.loop) {
       elapsed = elapsed % totalDuration;
     } else if (elapsed >= totalDuration) {
-      return null; // ProgramaÃƒÂ§ÃƒÂ£o encerrada
+      return null; // ProgramaÃ§Ã£o encerrada
     }
 
     let currentSum = 0;
@@ -502,6 +487,36 @@ const App: React.FC = () => {
     }
   };
 
+  const getPlaybackProgress = (offsetSeconds: number, durationSeconds?: number) => {
+    const safeDuration = Number(durationSeconds || 0);
+    const safeOffset = Math.max(0, Number(offsetSeconds || 0));
+    if (!Number.isFinite(safeDuration) || safeDuration <= 0) {
+      return { percent: 0, remainingPercent: 100, elapsedLabel: '00:00', durationLabel: '--:--' };
+    }
+
+    const clampedOffset = Math.min(safeOffset, safeDuration);
+    const percent = Math.max(0, Math.min(100, (clampedOffset / safeDuration) * 100));
+    const remainingPercent = Math.max(0, 100 - percent);
+
+    const formatClock = (valueSeconds: number) => {
+      const total = Math.max(0, Math.floor(valueSeconds));
+      const hours = Math.floor(total / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      const seconds = total % 60;
+      if (hours > 0) {
+        return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+      }
+      return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    };
+
+    return {
+      percent,
+      remainingPercent,
+      elapsedLabel: formatClock(clampedOffset),
+      durationLabel: formatClock(safeDuration),
+    };
+  };
+
   const formatChannelNumber = (ch: Channel, fallbackIndex?: number) => {
     const raw = String(ch.channel_id || '').trim();
     if (/^\d+$/.test(raw)) return raw.padStart(3, '0');
@@ -528,6 +543,7 @@ const App: React.FC = () => {
       for (const url of urls) {
         if (ytTitleByUrl[url]) continue;
         try {
+          continue;
           const oembed = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
           const r = await fetch(oembed, { signal: controller.signal });
           if (!r.ok) continue;
@@ -557,15 +573,6 @@ const App: React.FC = () => {
     }
   }, [selectedCategory, state.channels]);
 
-  useEffect(() => {
-    return () => {
-      if (focusAreaTimerRef.current) {
-        window.clearTimeout(focusAreaTimerRef.current);
-        focusAreaTimerRef.current = null;
-      }
-    };
-  }, []);
-
   const getPopularChannelIndices = useCallback((channels: Channel[]) => {
     // Placeholder for "popular": playlist order.
     return channels.map((_, i) => i);
@@ -575,61 +582,6 @@ const App: React.FC = () => {
     const byCategory = getCategoryChannelIndices(channels, selectedCategory);
     return byCategory.length ? byCategory : getPopularChannelIndices(channels);
   }, [getPopularChannelIndices, selectedCategory]);
-
-  const availableCategories = useMemo(() => getAvailableCategories(state.channels), [state.channels]);
-  const popularCards = useMemo(() => getPopularChannelIndices(state.channels), [getPopularChannelIndices, state.channels]);
-  const categoryCards = useMemo(() => getCategoryChannelIndices(state.channels, selectedCategory), [selectedCategory, state.channels]);
-  const cards = useMemo(() => getActiveCardIndices(state.channels), [getActiveCardIndices, state.channels]);
-
-  const pulseArea = useCallback((area: TvFocusArea) => {
-    setPulsedArea(area);
-    if (focusAreaTimerRef.current) {
-      window.clearTimeout(focusAreaTimerRef.current);
-    }
-    focusAreaTimerRef.current = window.setTimeout(() => {
-      setPulsedArea(current => (current === area ? null : current));
-      focusAreaTimerRef.current = null;
-    }, 3000);
-  }, []);
-
-  const clearAutoEnterAreaTimer = useCallback(() => {
-    if (!autoEnterAreaTimerRef.current) return;
-    window.clearTimeout(autoEnterAreaTimerRef.current);
-    autoEnterAreaTimerRef.current = null;
-  }, []);
-
-  const clearAreaBoundaryIntent = useCallback(() => {
-    areaBoundaryIntentRef.current = null;
-  }, []);
-
-  const focusArea = useCallback((area: TvFocusArea) => {
-    setFocusedArea(area);
-    clearAreaBoundaryIntent();
-    pulseArea(area);
-  }, [clearAreaBoundaryIntent, pulseArea]);
-
-  const activateArea = useCallback((area: TvFocusArea) => {
-    clearAutoEnterAreaTimer();
-    clearAreaBoundaryIntent();
-    setFocusedArea(area);
-    setActiveArea(area);
-    pulseArea(area);
-  }, [clearAreaBoundaryIntent, clearAutoEnterAreaTimer, pulseArea]);
-
-  const moveAreaFocus = useCallback((direction: 'left' | 'right' | 'up' | 'down') => {
-    clearAreaBoundaryIntent();
-    setFocusedArea(prev => {
-      const next = TV_AREA_GRAPH[prev]?.[direction] || prev;
-      pulseArea(next);
-      return next;
-    });
-  }, [clearAreaBoundaryIntent, pulseArea]);
-
-  const exitAreaNavigation = useCallback(() => {
-    setActiveArea(null);
-    clearAreaBoundaryIntent();
-    pulseArea(focusedArea);
-  }, [clearAreaBoundaryIntent, focusedArea, pulseArea]);
 
   const selectChannel = useCallback((channelIndex: number) => {
     setState(prev => (
@@ -666,16 +618,8 @@ const App: React.FC = () => {
   const openChannelLarge = useCallback((channelIndex: number) => {
     const ch = state.channels[channelIndex];
     if (!ch) return;
-
-    let live = getLivePlaybackState(ch);
+    const live = getLivePlaybackState(ch);
     if (!live) return;
-
-    if (live.offset >= Math.max(0, live.item.duration - 1)) {
-      const nextPlayback = getNextPlaybackState(ch, live.index);
-      if (nextPlayback) {
-        live = nextPlayback;
-      }
-    }
 
     selectChannel(channelIndex);
     setExpandedPlayback({ channelIndex, playback: live });
@@ -686,7 +630,7 @@ const App: React.FC = () => {
       const fn = el?.requestFullscreen || el?.webkitRequestFullscreen || el?.msRequestFullscreen;
       if (fn) fn.call(el);
     });
-  }, [getNextPlaybackState, selectChannel, state.channels]);
+  }, [selectChannel, state.channels]);
 
   const closeExpanded = useCallback(() => {
     setExpandedPlayback(null);
@@ -694,6 +638,39 @@ const App: React.FC = () => {
     const fn = (document as any).exitFullscreen || (document as any).webkitExitFullscreen || (document as any).msExitFullscreen;
     if (fn) fn.call(document);
   }, []);
+
+  const advanceExpandedPlayback = useCallback(() => {
+    if (!expandedPlayback) return;
+    const channel = state.channels[expandedPlayback.channelIndex];
+    if (!channel || !channel.items.length) return;
+
+    const nextIndex = expandedPlayback.playback.index + 1;
+    if (nextIndex < channel.items.length) {
+      setExpandedPlayback({
+        channelIndex: expandedPlayback.channelIndex,
+        playback: {
+          item: channel.items[nextIndex],
+          offset: 0,
+          index: nextIndex,
+        },
+      });
+      return;
+    }
+
+    if (channel.loop) {
+      setExpandedPlayback({
+        channelIndex: expandedPlayback.channelIndex,
+        playback: {
+          item: channel.items[0],
+          offset: 0,
+          index: 0,
+        },
+      });
+      return;
+    }
+
+    closeExpanded();
+  }, [closeExpanded, expandedPlayback, state.channels]);
 
   const getWrappedNextChannelIndex = useCallback((currentIndex: number, delta: number) => {
     const cards = getActiveCardIndices(state.channels);
@@ -707,66 +684,9 @@ const App: React.FC = () => {
   }, [getActiveCardIndices, state.channels]);
 
   const moveCardSelection = useCallback((delta: number) => {
-    const currentPos = cards.indexOf(state.currentChannelIndex);
-    if (currentPos < 0) {
-      if (cards[0] == null) return false;
-      selectChannel(cards[0]);
-      return true;
-    }
-
-    const nextPos = currentPos + delta;
-    if (nextPos < 0 || nextPos >= cards.length) return false;
-
-    selectChannel(cards[nextPos]);
-    return true;
-  }, [cards, selectChannel, state.currentChannelIndex]);
-
-  const movePopularSelection = useCallback((delta: number) => {
-    if (!popularCards.length) return false;
-    const currentPos = Math.max(0, popularCards.indexOf(state.currentChannelIndex));
-    const nextPos = currentPos + delta;
-    if (nextPos < 0 || nextPos >= popularCards.length) return false;
-    selectChannel(popularCards[nextPos]);
-    return true;
-  }, [popularCards, selectChannel, state.currentChannelIndex]);
-
-  const moveCategorySelection = useCallback((delta: number) => {
-    if (!availableCategories.length) return false;
-    const currentIndex = Math.max(0, availableCategories.findIndex(cat => cat.id === selectedCategory));
-    const nextIndex = currentIndex + delta;
-    if (nextIndex < 0 || nextIndex >= availableCategories.length) return false;
-    const nextCategory = availableCategories[nextIndex];
-    if (!nextCategory) return false;
-    setSelectedCategory(nextCategory.id);
-    const nextChannelIndex = state.channels.findIndex(ch => getChannelCategory(ch) === nextCategory.id);
-    if (nextChannelIndex >= 0) selectChannel(nextChannelIndex);
-    return true;
-  }, [availableCategories, selectChannel, selectedCategory, state.channels]);
-
-  const moveToNeighborArea = useCallback((direction: 'left' | 'right' | 'up' | 'down') => {
-    const currentArea = activeAreaRef.current;
-    if (!currentArea) return false;
-
-    const nextArea = TV_AREA_GRAPH[currentArea]?.[direction];
-    if (!nextArea || nextArea === currentArea) return false;
-
-    const intent = areaBoundaryIntentRef.current;
-    if (!intent || intent.area != currentArea || intent.direction != direction) {
-      areaBoundaryIntentRef.current = { area: currentArea, direction };
-      pulseArea(currentArea);
-      return false;
-    }
-
-    activateArea(nextArea);
-    return true;
-  }, [activateArea, pulseArea]);
-
-  useEffect(() => {
-    if (activeArea !== 'cards') return;
-    if (!cards.length) return;
-    if (cards.includes(state.currentChannelIndex)) return;
-    selectChannel(cards[0]);
-  }, [activeArea, cards, selectChannel, state.currentChannelIndex]);
+    const nextChannelIndex = getWrappedNextChannelIndex(state.currentChannelIndex, delta);
+    selectChannel(nextChannelIndex);
+  }, [getWrappedNextChannelIndex, selectChannel, state.currentChannelIndex]);
 
   const isBackActionKey = (e: KeyboardEvent) => {
     const code = (e as any).keyCode as number | undefined;
@@ -790,63 +710,28 @@ const App: React.FC = () => {
     viewport.scrollBy({ left: dir * (chipWidth + 12) * 4, behavior: 'smooth' });
   }, []);
 
-  function getNextPlaybackState(channel: Channel, currentIndex: number) {
-    if (!channel.items.length) return null;
-
-    const nextIndex = currentIndex + 1;
-    if (nextIndex < channel.items.length) {
-      return { item: channel.items[nextIndex], offset: 0, index: nextIndex };
-    }
-
-    if (!channel.loop) return null;
-    return { item: channel.items[0], offset: 0, index: 0 };
-  }
-
-  const syncExpandedPlayback = useCallback((channelIndex: number, fallbackIndex?: number) => {
-    const channel = state.channels[channelIndex];
-    if (!channel) return false;
-
-    let livePlayback = getLivePlaybackState(channel);
-    if ((!livePlayback || (fallbackIndex !== undefined && livePlayback.index === fallbackIndex)) && fallbackIndex !== undefined) {
-      livePlayback = getNextPlaybackState(channel, fallbackIndex);
-    }
-
-    if (!livePlayback) {
-      closeExpanded();
-      return false;
-    }
-
-    selectChannel(channelIndex);
-    setExpandedPlayback({ channelIndex, playback: livePlayback });
-    return true;
-  }, [closeExpanded, getLivePlaybackState, getNextPlaybackState]);
-
-  const handleExpandedPlaybackEnded = useCallback(() => {
-    if (!expandedPlayback) return;
-    syncExpandedPlayback(expandedPlayback.channelIndex, expandedPlayback.playback.index);
-  }, [expandedPlayback, syncExpandedPlayback]);
-
-  const changeExpandedChannel = useCallback((delta: number) => {
-    if (!expandedPlayback) return;
-    const nextChannelIndex = getWrappedNextChannelIndex(expandedPlayback.channelIndex, delta);
-    syncExpandedPlayback(nextChannelIndex);
-  }, [expandedPlayback, getWrappedNextChannelIndex, syncExpandedPlayback]);
-
   const showExpandedInfo = useCallback(() => {
-    if (!expandedPlayback) return;
-
     setIsExpandedInfoVisible(true);
-    if (expandedInfoTimerRef.current) window.clearTimeout(expandedInfoTimerRef.current);
+    if (expandedInfoTimerRef.current) {
+      window.clearTimeout(expandedInfoTimerRef.current);
+    }
     expandedInfoTimerRef.current = window.setTimeout(() => {
       setIsExpandedInfoVisible(false);
       expandedInfoTimerRef.current = null;
     }, 5000);
-  }, [expandedPlayback]);
-
-  const clearExpandedSeekDrag = useCallback(() => {
-    expandedSeekDragCleanupRef.current?.();
-    expandedSeekDragCleanupRef.current = null;
   }, []);
+
+  const changeExpandedChannel = useCallback((delta: number) => {
+    if (!expandedPlayback) return;
+    const nextChannelIndex = getWrappedNextChannelIndex(expandedPlayback.channelIndex, delta);
+    const nextChannel = state.channels[nextChannelIndex];
+    if (!nextChannel) return;
+    const nextPlayback = getLivePlaybackState(nextChannel);
+    if (!nextPlayback) return;
+
+    selectChannel(nextChannelIndex);
+    setExpandedPlayback({ channelIndex: nextChannelIndex, playback: nextPlayback });
+  }, [expandedPlayback, getWrappedNextChannelIndex, selectChannel, state.channels]);
 
   const clampExpandedOffset = useCallback((item: PlaylistItem, nextOffset: number) => {
     const duration = Number(item.duration || 0);
@@ -854,17 +739,18 @@ const App: React.FC = () => {
     return Math.min(Math.max(0, nextOffset), maxOffset);
   }, []);
 
-  const getExpandedMaxOffset = useCallback((playback: LivePlayback, channelIndex: number) => {
-    const livePlayback = state.channels[channelIndex]
-      ? getLivePlaybackState(state.channels[channelIndex])
-      : null;
+  const getExpandedMaxOffset = useCallback((channelIndex: number, playback: LivePlayback) => {
+    const duration = Number(playback.item.duration || 0);
+    const itemMaxOffset = duration > 0 ? Math.max(0, duration - 0.25) : 0;
+    const channel = state.channels[channelIndex];
+    if (!channel) return itemMaxOffset;
 
-    if (livePlayback && livePlayback.index === playback.index) {
-      return clampExpandedOffset(playback.item, livePlayback.offset);
-    }
+    const livePlayback = getLivePlaybackState(channel);
+    if (!livePlayback) return itemMaxOffset;
+    if (livePlayback.index !== playback.index) return itemMaxOffset;
 
-    return clampExpandedOffset(playback.item, Number(playback.item.duration || 0));
-  }, [clampExpandedOffset, getLivePlaybackState, state.channels]);
+    return Math.min(itemMaxOffset, Math.max(0, livePlayback.offset));
+  }, [getLivePlaybackState, state.channels]);
 
   const getExpandedEffectiveOffset = useCallback((anchor: ExpandedSeekAnchor | null, playback: LivePlayback, currentNow: number) => {
     if (
@@ -873,14 +759,20 @@ const App: React.FC = () => {
       anchor.channelIndex === expandedPlayback.channelIndex &&
       anchor.playbackIndex === playback.index
     ) {
-      return clampExpandedOffset(
-        playback.item,
-        anchor.baseOffset + Math.max(0, (currentNow - anchor.startedAtMs) / 1000),
+      return Math.min(
+        clampExpandedOffset(
+          playback.item,
+          anchor.baseOffset + Math.max(0, (currentNow - anchor.startedAtMs) / 1000),
+        ),
+        getExpandedMaxOffset(expandedPlayback.channelIndex, playback),
       );
     }
 
-    return clampExpandedOffset(playback.item, playback.offset);
-  }, [clampExpandedOffset, expandedPlayback]);
+    return Math.min(
+      clampExpandedOffset(playback.item, playback.offset),
+      expandedPlayback ? getExpandedMaxOffset(expandedPlayback.channelIndex, playback) : clampExpandedOffset(playback.item, playback.offset),
+    );
+  }, [clampExpandedOffset, expandedPlayback, getExpandedMaxOffset]);
 
   const seekExpandedPlayback = useCallback((deltaSeconds: number) => {
     if (!expandedPlayback) return;
@@ -888,8 +780,8 @@ const App: React.FC = () => {
 
     const currentOffset = getExpandedEffectiveOffset(expandedSeekAnchor, expandedPlayback.playback, Date.now());
     const nextOffset = Math.min(
-      getExpandedMaxOffset(expandedPlayback.playback, expandedPlayback.channelIndex),
       clampExpandedOffset(expandedPlayback.playback.item, currentOffset + deltaSeconds),
+      getExpandedMaxOffset(expandedPlayback.channelIndex, expandedPlayback.playback),
     );
 
     setExpandedSeekAnchor({
@@ -901,60 +793,49 @@ const App: React.FC = () => {
     showExpandedInfo();
   }, [clampExpandedOffset, expandedPlayback, expandedSeekAnchor, getExpandedEffectiveOffset, getExpandedMaxOffset, showExpandedInfo]);
 
-  const seekExpandedPlaybackToClientX = useCallback((clientX: number) => {
-    if (!expandedPlayback) return;
-    if (expandedPlayback.playback.item.type !== ContentType.VIDEO) return;
+  const clearSeekHold = useCallback(() => {
+    if (seekHoldDelayTimerRef.current) {
+      window.clearTimeout(seekHoldDelayTimerRef.current);
+      seekHoldDelayTimerRef.current = null;
+    }
+    if (seekHoldRepeatTimerRef.current) {
+      window.clearInterval(seekHoldRepeatTimerRef.current);
+      seekHoldRepeatTimerRef.current = null;
+    }
+    window.removeEventListener('mouseup', window.__wiipynSeekHoldRelease as any);
+    window.removeEventListener('touchend', window.__wiipynSeekHoldRelease as any);
+    window.removeEventListener('touchcancel', window.__wiipynSeekHoldRelease as any);
+    window.__wiipynSeekHoldRelease = undefined;
+  }, []);
 
-    const bar = expandedSeekBarRef.current;
-    if (!bar) return;
+  const endSeekHold = useCallback((deltaSeconds: number) => {
+    const triggered = seekHoldTriggeredRef.current;
+    clearSeekHold();
+    seekHoldTriggeredRef.current = false;
+    if (!triggered) {
+      seekExpandedPlayback(deltaSeconds);
+    }
+  }, [clearSeekHold, seekExpandedPlayback]);
 
-    const rect = bar.getBoundingClientRect();
-    if (rect.width <= 0) return;
+  const startSeekHold = useCallback((deltaSeconds: number) => {
+    clearSeekHold();
+    seekHoldTriggeredRef.current = false;
 
-    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    const duration = Number(expandedPlayback.playback.item.duration || 0);
-    const unclampedOffset = duration * ratio;
-    const maxOffset = getExpandedMaxOffset(expandedPlayback.playback, expandedPlayback.channelIndex);
-    const nextOffset = Math.min(
-      maxOffset,
-      clampExpandedOffset(expandedPlayback.playback.item, unclampedOffset),
-    );
+    const release = () => endSeekHold(deltaSeconds);
+    window.__wiipynSeekHoldRelease = release;
+    window.addEventListener('mouseup', release, { once: true });
+    window.addEventListener('touchend', release, { once: true });
+    window.addEventListener('touchcancel', release, { once: true });
 
-    setExpandedSeekAnchor({
-      channelIndex: expandedPlayback.channelIndex,
-      playbackIndex: expandedPlayback.playback.index,
-      baseOffset: nextOffset,
-      startedAtMs: Date.now(),
-    });
-    showExpandedInfo();
-  }, [clampExpandedOffset, expandedPlayback, getExpandedMaxOffset, showExpandedInfo]);
-
-  const startExpandedSeekDrag = useCallback((clientX: number) => {
-    if (!expandedPlayback || expandedPlayback.playback.item.type !== ContentType.VIDEO) return;
-
-    clearExpandedSeekDrag();
-    seekExpandedPlaybackToClientX(clientX);
-
-    const handlePointerMove = (event: PointerEvent) => {
-      seekExpandedPlaybackToClientX(event.clientX);
-    };
-
-    const handlePointerUp = () => {
-      clearExpandedSeekDrag();
-    };
-
-    window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', handlePointerUp);
-    window.addEventListener('pointercancel', handlePointerUp);
-
-    expandedSeekDragCleanupRef.current = () => {
-      window.removeEventListener('pointermove', handlePointerMove);
-      window.removeEventListener('pointerup', handlePointerUp);
-      window.removeEventListener('pointercancel', handlePointerUp);
-    };
-  }, [clearExpandedSeekDrag, expandedPlayback, seekExpandedPlaybackToClientX]);
-
-  useEffect(() => clearExpandedSeekDrag, [clearExpandedSeekDrag]);
+    seekHoldDelayTimerRef.current = window.setTimeout(() => {
+      seekHoldDelayTimerRef.current = null;
+      seekHoldTriggeredRef.current = true;
+      seekExpandedPlayback(deltaSeconds);
+      seekHoldRepeatTimerRef.current = window.setInterval(() => {
+        seekExpandedPlayback(deltaSeconds);
+      }, 140);
+    }, 220);
+  }, [clearSeekHold, endSeekHold, seekExpandedPlayback]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -978,151 +859,13 @@ const App: React.FC = () => {
       const isOk =
         e.key === 'Enter' ||
         e.key === 'OK' ||
-        code === 13 ||
-        code === 23 ||
-        code === 66;
+        code === 13 || // Enter
+        code === 23 || // Android DPAD_CENTER
+        code === 66;   // Android ENTER
 
       if (isOk) {
         e.preventDefault();
-        if (isTvBoxNavigation && !expandedPlayback) {
-          if (!activeArea) {
-            activateArea(focusedArea);
-            return;
-          }
-
-          if (activeArea === 'popular' || activeArea === 'cards') {
-            openChannelLarge(state.currentChannelIndex);
-          }
-          return;
-        }
-
         openChannelLarge(state.currentChannelIndex);
-        return;
-      }
-
-      if (isTvBoxNavigation && !expandedPlayback) {
-        if (isBackActionKey(e)) {
-          if (activeArea) {
-            e.preventDefault();
-            exitAreaNavigation();
-          }
-          return;
-        }
-
-        if (!activeArea) {
-          switch (e.key) {
-            case 'ArrowLeft':
-              e.preventDefault();
-              moveAreaFocus('left');
-              break;
-            case 'ArrowRight':
-              e.preventDefault();
-              moveAreaFocus('right');
-              break;
-            case 'ArrowUp':
-              e.preventDefault();
-              moveAreaFocus('up');
-              break;
-            case 'ArrowDown':
-              e.preventDefault();
-              moveAreaFocus('down');
-              break;
-          }
-          return;
-        }
-
-        if (activeArea === 'search') {
-          if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            moveToNeighborArea('left');
-          } else if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            moveToNeighborArea('right');
-          } else if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            moveToNeighborArea('up');
-          } else if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            moveToNeighborArea('down');
-          }
-          return;
-        }
-
-        if (activeArea === 'categories') {
-          if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            if (moveCategorySelection(-1)) {
-              clearAreaBoundaryIntent();
-            } else {
-              moveToNeighborArea('up');
-            }
-          } else if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            if (moveCategorySelection(1)) {
-              clearAreaBoundaryIntent();
-            }
-          } else if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            moveToNeighborArea('right');
-          } else if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            moveToNeighborArea('left');
-          }
-          return;
-        }
-
-        if (activeArea === 'popular') {
-          if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            if (movePopularSelection(-1)) {
-              clearAreaBoundaryIntent();
-            } else {
-              moveToNeighborArea('left');
-            }
-          } else if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            if (movePopularSelection(1)) {
-              clearAreaBoundaryIntent();
-            }
-          } else if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            moveToNeighborArea('up');
-          } else if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            moveToNeighborArea('down');
-          }
-          return;
-        }
-
-        if (activeArea === 'cards') {
-          if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            if (moveCardSelection(-1)) {
-              clearAreaBoundaryIntent();
-            } else {
-              moveToNeighborArea('left');
-            }
-          } else if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            if (moveCardSelection(1)) {
-              clearAreaBoundaryIntent();
-            }
-          } else if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            if (moveCardSelection(-TV_GRID_COLUMNS)) {
-              clearAreaBoundaryIntent();
-            } else {
-              moveToNeighborArea('up');
-            }
-          } else if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            if (moveCardSelection(TV_GRID_COLUMNS)) {
-              clearAreaBoundaryIntent();
-            }
-          }
-          return;
-        }
-
         return;
       }
 
@@ -1137,7 +880,7 @@ const App: React.FC = () => {
         return;
       }
 
-      switch (e.key) {
+      switch(e.key) {
         case 'ArrowLeft':
           e.preventDefault();
           moveCardSelection(-1);
@@ -1148,99 +891,24 @@ const App: React.FC = () => {
           break;
         case 'ArrowUp':
           e.preventDefault();
-          moveCardSelection(-TV_GRID_COLUMNS);
+          moveCardSelection(-3);
           break;
         case 'ArrowDown':
           e.preventDefault();
-          moveCardSelection(TV_GRID_COLUMNS);
+          moveCardSelection(3);
           break;
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeArea, activateArea, changeExpandedChannel, clearAreaBoundaryIntent, closeExpanded, exitAreaNavigation, expandedPlayback, focusedArea, isAppMenuOpen, isTvBoxNavigation, moveAreaFocus, moveCardSelection, moveCategorySelection, movePopularSelection, moveToNeighborArea, openChannelLarge, state.currentChannelIndex, state.isInteracted]);
+  }, [changeExpandedChannel, closeExpanded, expandedPlayback, isAppMenuOpen, moveCardSelection, openChannelLarge, state.currentChannelIndex, state.isInteracted]);
 
-  useEffect(() => {
-    if (!isTvBoxNavigation || activeArea || expandedPlayback || isAppMenuOpen) {
-      clearAutoEnterAreaTimer();
-      return;
-    }
-
-    clearAutoEnterAreaTimer();
-    autoEnterAreaTimerRef.current = window.setTimeout(() => {
-      autoEnterAreaTimerRef.current = null;
-      if (activeAreaRef.current || expandedPlaybackRef.current || isAppMenuOpenRef.current) return;
-      activateArea(focusedArea);
-    }, 2000);
-
-    return clearAutoEnterAreaTimer;
-  }, [activeArea, activateArea, clearAutoEnterAreaTimer, expandedPlayback, focusedArea, isAppMenuOpen, isTvBoxNavigation]);
-
-  useEffect(() => {
-    if (!isNativeApp()) return;
-
-    let cleaned = false;
-    let removeListener: (() => Promise<void>) | null = null;
-
-    const loadCapacitorApp = new Function("return import('@capacitor/app')") as () => Promise<{ App: { addListener: (...args: any[]) => Promise<{ remove: () => Promise<void> }>; exitApp: () => Promise<void>; } }>;
-
-    void loadCapacitorApp().then(({ App: CapacitorApp }) => {
-      if (cleaned) return;
-
-      const listener = CapacitorApp.addListener('backButton', ({ canGoBack }) => {
-        if (isAppMenuOpenRef.current) {
-          setIsAppMenuOpen(false);
-          return;
-        }
-
-        if (expandedPlaybackRef.current) {
-          closeExpanded();
-          return;
-        }
-
-        if (activeAreaRef.current) {
-          areaBoundaryIntentRef.current = null;
-          setActiveArea(null);
-          pulseArea(activeAreaRef.current);
-          return;
-        }
-
-        if (canGoBack && window.history.length > 1) {
-          window.history.back();
-          return;
-        }
-
-        void CapacitorApp.exitApp();
-      });
-
-      removeListener = async () => {
-        const handle = await listener;
-        await handle.remove();
-      };
-    }).catch(() => {
-      removeListener = null;
-    });
-
-    return () => {
-      cleaned = true;
-      void removeListener?.();
-    };
-  }, [closeExpanded, pulseArea]);
-
-  useEffect(() => {
-    activeAreaRef.current = activeArea;
-  }, [activeArea]);
-
-  useEffect(() => {
-    expandedPlaybackRef.current = expandedPlayback;
-  }, [expandedPlayback]);
-
-  useEffect(() => {
-    isAppMenuOpenRef.current = isAppMenuOpen;
-  }, [isAppMenuOpen]);
-
-  const shouldLoopCarousel = false;
+  const categoryCards = getCategoryChannelIndices(state.channels, selectedCategory);
+  const cards = getActiveCardIndices(state.channels);
+  const popularCards = getPopularChannelIndices(state.channels);
+  const availableCategories = getAvailableCategories(state.channels);
+  const shouldLoopCarousel = popularCards.length > 1;
   const carouselCardsKey = popularCards.join('|');
 
   useEffect(() => {
@@ -1254,6 +922,8 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!expandedPlayback) {
+      clearSeekHold();
+      seekHoldTriggeredRef.current = false;
       setExpandedSeekAnchor(null);
       setIsExpandedInfoVisible(false);
       if (expandedInfoTimerRef.current) {
@@ -1277,7 +947,36 @@ const App: React.FC = () => {
         expandedInfoTimerRef.current = null;
       }
     };
-  }, [expandedPlayback?.channelIndex, expandedPlayback?.playback.index, expandedPlayback?.playback.offset, showExpandedInfo]);
+  }, [clearSeekHold, expandedPlayback?.channelIndex, expandedPlayback?.playback.index, expandedPlayback?.playback.offset, showExpandedInfo]);
+
+  useEffect(() => {
+    clearPlaybackAdvanceTimer();
+
+    if (!expandedPlayback) return;
+
+    const item = expandedPlayback.playback.item;
+    if ((item.type !== ContentType.VIDEO && item.type !== ContentType.AD) || !Number.isFinite(item.duration) || item.duration <= 0) {
+      return;
+    }
+
+    const activeOffset = expandedSeekAnchor &&
+      expandedSeekAnchor.channelIndex === expandedPlayback.channelIndex &&
+      expandedSeekAnchor.playbackIndex === expandedPlayback.playback.index
+        ? expandedSeekAnchor.baseOffset
+        : expandedPlayback.playback.offset;
+
+    const autoAdvanceLeadMs = expandedPlayback.playback.item.type === ContentType.VIDEO ? 150 : 0;
+    const remainingMs = Math.max(250, Math.round(Math.max(0, item.duration - activeOffset) * 1000) - autoAdvanceLeadMs);
+
+    playbackAdvanceTimerRef.current = window.setTimeout(() => {
+      playbackAdvanceTimerRef.current = null;
+      advanceExpandedPlayback();
+    }, remainingMs);
+
+    return () => {
+      clearPlaybackAdvanceTimer();
+    };
+  }, [advanceExpandedPlayback, clearPlaybackAdvanceTimer, expandedPlayback?.channelIndex, expandedPlayback?.playback.index, expandedPlayback?.playback.offset, expandedPlayback?.playback.item.duration, expandedPlayback?.playback.item.type, expandedSeekAnchor?.channelIndex, expandedSeekAnchor?.playbackIndex, expandedSeekAnchor?.baseOffset]);
   useEffect(() => {
     clearBannerAdTimers();
 
@@ -1288,96 +987,19 @@ const App: React.FC = () => {
     }
 
     const channel = state.channels[expandedPlayback.channelIndex];
-    const banners = channel?.banner_ads || [];
-    if (!banners.length) {
+    const banner = channel?.banner_ads?.[0] || null;
+    if (!banner) {
       setIsBannerAdVisible(false);
       setActiveBannerAd(null);
       return;
     }
 
     const bannerExitDurationMs = 400;
-    const getBannerDisplayMs = (banner: BannerAd) => Math.max(1000, Math.round((Number(banner.duration) || 5) * 1000));
-    const getBannerWeight = (banner: BannerAd) => {
-      const repeatCount = Number(banner.repeat_count_per_day);
-      if (Number.isFinite(repeatCount) && repeatCount > 0) return repeatCount;
 
-      const intervalMinutes = Number(banner.interval_minutes);
-      if (Number.isFinite(intervalMinutes) && intervalMinutes > 0) {
-        return (24 * 60) / intervalMinutes;
-      }
-
-      return 1;
-    };
-    let lastServedSlotKey: string | null = null;
-    let lastServedIndex: number | null = null;
-    const servedCounts = new Map<number, number>();
-    const bannerPhaseOffsets = (() => {
-      const offsets = new Map<number, number>();
-      const groups = new Map<string, number[]>();
-
-      banners.forEach((entry, index) => {
-        const key = String(entry.start_time || '00:00').trim() || '00:00';
-        const existing = groups.get(key) || [];
-        existing.push(index);
-        groups.set(key, existing);
-      });
-
-      groups.forEach((indices) => {
-        if (!indices.length) return;
-        const baseIntervalMs = Math.max(60 * 1000, Math.min(...indices.map((index) => getBannerIntervalMs(banners[index]))));
-        indices.forEach((index, order) => {
-          const phaseOffsetMs = indices.length > 1 ? Math.round((baseIntervalMs / indices.length) * order) : 0;
-          offsets.set(index, phaseOffsetMs);
-        });
-      });
-
-      return offsets;
-    })();
     const syncBannerSchedule = () => {
-      const nowMs = Date.now();
-      const schedules = banners.map((entry, index) => ({
-        banner: entry,
-        index,
-        schedule: getBannerOccurrenceWithPhase(entry, nowMs, bannerPhaseOffsets.get(index) || 0),
-      }));
-
-      const activeCandidates = schedules
-        .filter(({ schedule }) => schedule.isActiveWindow)
-        .sort((a, b) => (
-          a.schedule.occurrenceStartMs - b.schedule.occurrenceStartMs || a.index - b.index
-        ));
-
-      const slotKey = activeCandidates
-        .map(({ index, schedule }) => `${index}:${schedule.occurrenceStartMs}`)
-        .join('|');
-
-      if (activeCandidates.length && slotKey !== lastServedSlotKey) {
-        const candidatePool = lastServedIndex !== null && activeCandidates.some(({ index }) => index !== lastServedIndex)
-          ? activeCandidates.filter(({ index }) => index !== lastServedIndex)
-          : activeCandidates;
-
-        const nextBanner = candidatePool
-          .map((entry) => {
-            const weight = Math.max(1, getBannerWeight(entry.banner));
-            const served = servedCounts.get(entry.index) || 0;
-            return {
-              ...entry,
-              weight,
-              served,
-              score: served / weight,
-            };
-          })
-          .sort((a, b) => (
-            a.score - b.score ||
-            b.weight - a.weight ||
-            a.schedule.occurrenceStartMs - b.schedule.occurrenceStartMs ||
-            a.index - b.index
-          ))[0];
-
-        servedCounts.set(nextBanner.index, (servedCounts.get(nextBanner.index) || 0) + 1);
-        lastServedIndex = nextBanner.index;
-        lastServedSlotKey = slotKey;
-        setActiveBannerAd(nextBanner.banner);
+      const schedule = getBannerOccurrence(banner, Date.now());
+      if (schedule.isActiveWindow) {
+        setActiveBannerAd(banner);
         setIsBannerAdVisible(true);
         bannerAdTimerRef.current = window.setTimeout(() => {
           setIsBannerAdVisible(false);
@@ -1385,19 +1007,15 @@ const App: React.FC = () => {
             setActiveBannerAd(null);
             syncBannerSchedule();
           }, bannerExitDurationMs);
-        }, Math.max(250, Math.min(nextBanner.schedule.remainingMs, getBannerDisplayMs(nextBanner.banner))));
+        }, schedule.remainingMs);
         return;
       }
-
-      const waitUntilNextStartMs = schedules.length
-        ? Math.min(...schedules.map(({ schedule }) => schedule.waitUntilNextStartMs))
-        : 1000;
 
       setIsBannerAdVisible(false);
       setActiveBannerAd(null);
       bannerAdTimerRef.current = window.setTimeout(() => {
         syncBannerSchedule();
-      }, waitUntilNextStartMs);
+      }, schedule.waitUntilNextStartMs);
     };
 
     syncBannerSchedule();
@@ -1432,22 +1050,20 @@ const App: React.FC = () => {
       ? `[data-carousel-segment="1"] [data-popular-channel-idx="${state.currentChannelIndex}"]`
       : `[data-popular-channel-idx="${state.currentChannelIndex}"]`;
     const selected = viewport.querySelector<HTMLElement>(selector);
-    if (!selected) return;
-    selected.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+    selected?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
   }, [shouldLoopCarousel, state.currentChannelIndex, carouselCardsKey]);
 
   useEffect(() => {
-    if (isTvBoxNavigation && activeArea !== 'cards') return;
     const viewport = cardsViewportRef.current;
     if (!viewport) return;
     const selected = viewport.querySelector<HTMLElement>(`[data-grid-channel-idx="${state.currentChannelIndex}"]`);
     selected?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
-  }, [activeArea, isTvBoxNavigation, state.currentChannelIndex, selectedCategory]);
+  }, [state.currentChannelIndex, selectedCategory]);
 
   if (state.isLoading) {
     return (
       <div className="h-screen w-screen flex flex-col items-center justify-center bg-black p-10 text-center">
-        <p className="text-slate-300 text-lg">Carregando canais do EDGEÃ¢â‚¬Â¦</p>
+        <p className="text-slate-300 text-lg">Carregando canais do EDGEâ€¦</p>
         <p className="text-slate-500 text-sm mt-2">Base: {EDGE_BASE_URL}{edgeResolvedName ? ` (${edgeResolvedName})` : ''}</p>
       </div>
     );
@@ -1458,7 +1074,7 @@ const App: React.FC = () => {
       <div className="relative h-screen w-screen overflow-hidden bg-black p-10 text-center">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_10%,rgba(53,173,255,0.22),transparent_34%),radial-gradient(circle_at_80%_16%,rgba(255,136,51,0.16),transparent_30%),radial-gradient(circle_at_50%_100%,rgba(110,36,255,0.22),transparent_45%)]" />
         <div className="relative z-10 flex h-full flex-col items-center justify-center">
-          <div className="relative mb-[2.2%] w-[min(400px,88vw)]">
+          <div className="relative mb-[2.2%] w-[min(56vw,860px)] max-w-[88vw]">
             <div className="absolute inset-[-8%] bg-[radial-gradient(circle,rgba(60,174,255,0.28)_0%,rgba(255,134,58,0.2)_38%,transparent_72%)] blur-3xl" />
             <div className="relative rounded-[1.6vw] border border-white/12 bg-white/[0.03] p-[1.1%] shadow-[0_32px_120px_rgba(0,0,0,0.45)] backdrop-blur-sm">
               <img src={BRAND_LOGO_SRC} alt={BRAND_NAME} className="w-full h-auto rounded-[1vw] object-contain" />
@@ -1513,29 +1129,12 @@ const App: React.FC = () => {
   const expandedEffectiveOffset = expandedPlayback
     ? getExpandedEffectiveOffset(expandedSeekAnchor, expandedPlayback.playback, now)
     : 0;
-  const expandedDuration = Number(expandedItem?.duration || 0);
-  const expandedMaxOffset = expandedPlayback
-    ? getExpandedMaxOffset(expandedPlayback.playback, expandedPlayback.channelIndex)
-    : 0;
-  const expandedProgressPercent = expandedDuration > 0
-    ? Math.max(0, Math.min(100, (expandedEffectiveOffset / expandedDuration) * 100))
-    : 0;
-  const expandedLiveCapPercent = expandedDuration > 0
-    ? Math.max(0, Math.min(100, (expandedMaxOffset / expandedDuration) * 100))
-    : 0;
-  const formatPlaybackClock = (seconds: number) => {
-    const total = Math.max(0, Math.floor(seconds));
-    const hh = Math.floor(total / 3600);
-    const mm = Math.floor((total % 3600) / 60);
-    const ss = total % 60;
-    return hh > 0
-      ? `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`
-      : `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
-  };
+  const expandedProgress = getPlaybackProgress(expandedEffectiveOffset, expandedItem?.duration);
   const renderChannelCard = (chIdx: number, key: string) => {
     const ch = state.channels[chIdx];
     const live = getLivePlaybackState(ch);
     const liveItem = live?.item || null;
+    const liveProgress = getPlaybackProgress(live?.offset || 0, liveItem?.duration);
     const isSelected = chIdx === state.currentChannelIndex;
     const iconUrl = resolveChannelIconUrl(ch.name);
     const thumbUrl = getCardThumbUrl(ch, liveItem);
@@ -1545,19 +1144,10 @@ const App: React.FC = () => {
       <article key={key} data-grid-channel-idx={chIdx} className="min-w-0 snap-start">
         <button
           type="button"
-          onFocus={() => {
-            focusArea('cards');
-            selectChannel(chIdx);
-          }}
-          onMouseEnter={() => {
-            focusArea('cards');
-            startHoverPreview(chIdx);
-          }}
+          onFocus={() => selectChannel(chIdx)}
+          onMouseEnter={() => startHoverPreview(chIdx)}
           onMouseLeave={() => stopHoverPreview(chIdx)}
-          onClick={() => {
-            focusArea('cards');
-            openChannelLarge(chIdx);
-          }}
+          onClick={() => openChannelLarge(chIdx)}
           className={[
             'group w-full rounded-[1vw] overflow-hidden border text-left bg-black/25 transition-all',
             isSelected ? 'border-sky-300 ring-2 ring-sky-300/70' : 'border-white/15 hover:border-white/35',
@@ -1573,7 +1163,7 @@ const App: React.FC = () => {
                     url={hoverPreview!.playback.item.url!}
                     offset={hoverPreview!.playback.offset}
                     duration={hoverPreview!.playback.item.duration}
-                    onEnded={() => {}}
+                    onEnded={advanceExpandedPlayback}
                     muted
                   />
                 ) : (
@@ -1581,7 +1171,7 @@ const App: React.FC = () => {
                     key={`preview-${ch.channel_id}-${hoverPreview?.token}`}
                     url={hoverPreview!.playback.item.url!}
                     offset={hoverPreview!.playback.offset}
-                    onEnded={() => {}}
+                    onEnded={advanceExpandedPlayback}
                     muted
                   />
                 )}
@@ -1608,10 +1198,7 @@ const App: React.FC = () => {
 
         <button
           type="button"
-          onClick={() => {
-            focusArea('cards');
-            openChannelLarge(chIdx);
-          }}
+          onClick={() => openChannelLarge(chIdx)}
           className="mt-[1.1%] w-full text-left"
         >
           <div className="flex items-start gap-[2.6%]">
@@ -1643,42 +1230,27 @@ const App: React.FC = () => {
               </div>
               <div className="text-[0.9vw] text-white/70 truncate">{ch.name}</div>
               <div className="text-[0.82vw] text-white/55 truncate">
-                {getScheduleSlots(ch, 1)[0]?.time || '--:--'} Â· Ao vivo
+                {getScheduleSlots(ch, 1)[0]?.time || '--:--'} · Ao vivo
               </div>
+              {liveItem && liveItem.duration > 0 && (
+                <div className="mt-[0.45vw]">
+                  <div className="overflow-hidden rounded-full border border-cyan-300/70 bg-white/10 p-[0.12vw] shadow-[0_0_0_0.08vw_rgba(34,211,238,0.25)] backdrop-blur-[2px]">
+                    <div className="h-[0.34vw] overflow-hidden rounded-full bg-white/15">
+                      <div
+                        className="h-full rounded-full bg-[repeating-linear-gradient(135deg,rgba(34,211,238,0.96)_0,rgba(34,211,238,0.96)_0.28vw,rgba(255,255,255,0.26)_0.28vw,rgba(255,255,255,0.26)_0.46vw)] shadow-[0_0_0.65vw_rgba(34,211,238,0.35)]"
+                        style={{ width: `${liveProgress.percent}%` }}
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-[0.28vw] text-[0.72vw] text-cyan-50/82">
+                    {liveProgress.elapsedLabel} / {liveProgress.durationLabel}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </button>
       </article>
-    );
-  };
-
-  const isAreaFocused = (area: TvFocusArea) => focusedArea === area;
-  const isAreaActive = (area: TvFocusArea) => activeArea === area;
-  const isAreaPulsed = (area: TvFocusArea) => pulsedArea === area;
-
-  const getAreaShellClass = (area: TvFocusArea) => {
-    if (!isTvBoxNavigation) return 'relative';
-    if (isAreaActive(area)) return 'relative rounded-[1vw] border border-white/85 ring-2 ring-white/75 bg-white/[0.03] shadow-[0_0_0_1px_rgba(255,255,255,0.18),0_18px_60px_rgba(20,120,255,0.22)]';
-    if (isAreaPulsed(area)) return 'relative rounded-[1vw] border border-sky-300/80 ring-2 ring-sky-300/70 bg-sky-300/[0.06] shadow-[0_0_0_1px_rgba(125,211,252,0.18),0_16px_46px_rgba(14,165,233,0.24)]';
-    if (isAreaFocused(area)) return 'relative rounded-[1vw] border border-sky-300/45 ring-1 ring-sky-300/35 bg-white/[0.02]';
-    return 'relative rounded-[1vw] border border-transparent';
-  };
-
-  const getAreaHint = (area: TvFocusArea) => {
-    if (!isTvBoxNavigation) return '';
-    if (isAreaActive(area)) return 'Voltar para sair da area';
-    if (isAreaPulsed(area)) return 'Enter para entrar na area';
-    return '';
-  };
-
-  const renderAreaHint = (area: TvFocusArea) => {
-    const hint = getAreaHint(area);
-    if (!hint) return null;
-
-    return (
-      <div className="pointer-events-none absolute right-[1.2%] top-[1.2%] z-20 rounded-full border border-white/15 bg-black/65 px-[0.75vw] py-[0.35vw] text-[0.7vw] font-bold uppercase tracking-[0.16em] text-white/80">
-        {hint}
-      </div>
     );
   };
 
@@ -1703,11 +1275,7 @@ const App: React.FC = () => {
             className="h-[5.6vh] min-h-[44px] w-auto max-w-[16vw] object-contain drop-shadow-[0_8px_24px_rgba(60,174,255,0.22)]"
           />
 
-          <div
-            className={['flex-1 max-w-[54%] px-[0.35%] py-[0.4%]', getAreaShellClass('search')].join(' ')}
-            onMouseEnter={() => focusArea('search')}
-          >
-            {renderAreaHint('search')}
+          <div className="flex-1 max-w-[54%]">
             <div className="h-[5.5vh] rounded-full bg-white/95 text-slate-800 flex items-center px-[2%] border border-black/10">
               <Search className="w-[1.1vw] h-[1.1vw] text-slate-500" />
               <input
@@ -1837,11 +1405,7 @@ const App: React.FC = () => {
       )}
 
       <main className="relative z-10 flex-1 min-h-0 box-border px-[2.2%] pb-[2%] pt-[0.5%] grid grid-cols-[14%_86%] gap-[1.4%]">
-        <aside
-          className={['border-r border-white/20 pr-[6%] min-w-0 min-h-0 flex flex-col px-[3%] py-[2.5%]', getAreaShellClass('categories')].join(' ')}
-          onMouseEnter={() => focusArea('categories')}
-        >
-          {renderAreaHint('categories')}
+        <aside className="border-r border-white/20 pr-[6%] min-w-0 min-h-0 flex flex-col">
           <div className="text-[2vw] font-black leading-none tabular-nums">{clockLabel}</div>
           <div className="mt-[1.2%] text-sky-100/80 text-[0.75vw] uppercase tracking-[0.2em]">{dateLabel}</div>
 
@@ -1855,7 +1419,6 @@ const App: React.FC = () => {
                   key={cat.id}
                   type="button"
                   onClick={() => {
-                    focusArea('categories');
                     setSelectedCategory(cat.id);
                     const idx = state.channels.findIndex(ch => getChannelCategory(ch) === cat.id);
                     if (idx >= 0) selectChannel(idx);
@@ -1879,85 +1442,42 @@ const App: React.FC = () => {
         </aside>
 
         <section className="min-w-0 min-h-0 flex flex-col overflow-hidden">
-          <div
-            className={['px-[1.1%] py-[1.1%]', getAreaShellClass('popular')].join(' ')}
-            onMouseEnter={() => focusArea('popular')}
-          >
-            {renderAreaHint('popular')}
-            <div className="mb-[1.2%] flex items-center justify-between gap-[1%]">
-              <div className="flex items-center gap-[1%] min-w-0">
-                <h2 className="text-[1.65vw] font-black uppercase tracking-wide truncate">Mais populares</h2>
-                <span className="text-[0.82vw] text-white/70 shrink-0">{popularCards.length} canais</span>
-              </div>
-              <div className="flex items-center gap-[0.5%]">
-                <button
-                  type="button"
-                  onClick={() => {
-                    focusArea('popular');
-                    scrollCarousel(-1);
-                  }}
-                  className="w-[2.2vw] h-[2.2vw] rounded-full border border-white/20 bg-white/5 hover:bg-white/15"
-                  aria-label="Canal anterior"
-                >
-                  {'<'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    focusArea('popular');
-                    scrollCarousel(1);
-                  }}
-                  className="w-[2.2vw] h-[2.2vw] rounded-full border border-white/20 bg-white/5 hover:bg-white/15"
-                  aria-label="Proximo canal"
-                >
-                  {'>'}
-                </button>
-              </div>
+          <div className="mb-[1.2%] flex items-center justify-between gap-[1%]">
+            <div className="flex items-center gap-[1%] min-w-0">
+              <h2 className="text-[1.65vw] font-black uppercase tracking-wide truncate">Mais populares</h2>
+              <span className="text-[0.82vw] text-white/70 shrink-0">{popularCards.length} canais</span>
             </div>
+            <div className="flex items-center gap-[0.5%]">
+              <button
+                type="button"
+                onClick={() => scrollCarousel(-1)}
+                className="w-[2.2vw] h-[2.2vw] rounded-full border border-white/20 bg-white/5 hover:bg-white/15"
+                aria-label="Canal anterior"
+              >
+                {'<'}
+              </button>
+              <button
+                type="button"
+                onClick={() => scrollCarousel(1)}
+                className="w-[2.2vw] h-[2.2vw] rounded-full border border-white/20 bg-white/5 hover:bg-white/15"
+                aria-label="Próximo canal"
+              >
+                {'>'}
+              </button>
+            </div>
+          </div>
 
-            <div
-              ref={carouselViewportRef}
-              className="overflow-x-auto overflow-y-hidden pb-[0.8%]"
-            >
-              <div className="flex gap-[0.8vw] w-max items-center">
-                {shouldLoopCarousel ? (
-                  Array.from({ length: 3 }).map((_, segmentIndex) => (
-                    <div
-                      key={`seg-${segmentIndex}`}
-                      ref={segmentIndex === 0 ? carouselSegmentRef : null}
-                      data-carousel-segment={segmentIndex}
-                      className="flex gap-[0.8vw] shrink-0 items-center"
-                    >
-                      {popularCards.map((chIdx, pos) => {
-                        const ch = state.channels[chIdx];
-                        const isSelected = chIdx === state.currentChannelIndex;
-                        return (
-                          <button
-                            key={`chip-${segmentIndex}-${pos}-${chIdx}`}
-                            type="button"
-                            data-popular-chip="1"
-                            data-popular-channel-idx={chIdx}
-                            onClick={() => {
-                              focusArea('popular');
-                              openChannelLarge(chIdx);
-                            }}
-                            className={[
-                              'shrink-0 min-w-max inline-flex items-center whitespace-nowrap leading-none select-none px-[1.25vw] py-[0.5vw] rounded-[0.8vw] text-[0.95vw] font-extrabold uppercase border transition-colors',
-                              isSelected
-                                ? 'bg-white text-[#0a1d80] border-white'
-                                : 'bg-white/10 text-white border-white/10 hover:bg-white/20',
-                            ].join(' ')}
-                          >
-                            {ch.name}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  ))
-                ) : (
+          <div
+            ref={carouselViewportRef}
+            className="overflow-x-auto overflow-y-hidden pb-[0.8%]"
+          >
+            <div className="flex gap-[0.8vw] w-max items-center">
+              {shouldLoopCarousel ? (
+                Array.from({ length: 3 }).map((_, segmentIndex) => (
                   <div
-                    ref={carouselSegmentRef}
-                    data-carousel-segment={0}
+                    key={`seg-${segmentIndex}`}
+                    ref={segmentIndex === 0 ? carouselSegmentRef : null}
+                    data-carousel-segment={segmentIndex}
                     className="flex gap-[0.8vw] shrink-0 items-center"
                   >
                     {popularCards.map((chIdx, pos) => {
@@ -1965,14 +1485,11 @@ const App: React.FC = () => {
                       const isSelected = chIdx === state.currentChannelIndex;
                       return (
                         <button
-                          key={`chip-0-${pos}-${chIdx}`}
+                          key={`chip-${segmentIndex}-${pos}-${chIdx}`}
                           type="button"
                           data-popular-chip="1"
                           data-popular-channel-idx={chIdx}
-                          onClick={() => {
-                            focusArea('popular');
-                            openChannelLarge(chIdx);
-                          }}
+                          onClick={() => openChannelLarge(chIdx)}
                           className={[
                             'shrink-0 min-w-max inline-flex items-center whitespace-nowrap leading-none select-none px-[1.25vw] py-[0.5vw] rounded-[0.8vw] text-[0.95vw] font-extrabold uppercase border transition-colors',
                             isSelected
@@ -1985,37 +1502,59 @@ const App: React.FC = () => {
                       );
                     })}
                   </div>
-                )}
-              </div>
+                ))
+              ) : (
+                <div
+                  ref={carouselSegmentRef}
+                  data-carousel-segment={0}
+                  className="flex gap-[0.8vw] shrink-0 items-center"
+                >
+                  {popularCards.map((chIdx, pos) => {
+                    const ch = state.channels[chIdx];
+                    const isSelected = chIdx === state.currentChannelIndex;
+                    return (
+                      <button
+                        key={`chip-0-${pos}-${chIdx}`}
+                        type="button"
+                        data-popular-chip="1"
+                        data-popular-channel-idx={chIdx}
+                        onClick={() => openChannelLarge(chIdx)}
+                        className={[
+                          'shrink-0 min-w-max inline-flex items-center whitespace-nowrap leading-none select-none px-[1.25vw] py-[0.5vw] rounded-[0.8vw] text-[0.95vw] font-extrabold uppercase border transition-colors',
+                          isSelected
+                            ? 'bg-white text-[#0a1d80] border-white'
+                            : 'bg-white/10 text-white border-white/10 hover:bg-white/20',
+                        ].join(' ')}
+                      >
+                        {ch.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
 
-          <div
-            className={['mt-[1.2%] flex-1 min-h-0 px-[1.1%] py-[1.1%]', getAreaShellClass('cards')].join(' ')}
-            onMouseEnter={() => focusArea('cards')}
-          >
-            {renderAreaHint('cards')}
-            <div className="mt-[1.5%] mb-[0.8%] flex items-center justify-between gap-[1%]">
-              <h3 className="text-[1.35vw] font-black uppercase tracking-wide truncate">
-                {categoryCards.length ? selectedCategory : 'Mais assistidos'}
-              </h3>
-              <span className="text-[0.82vw] text-white/70 shrink-0">{cards.length} cards</span>
-            </div>
+          <div className="mt-[1.5%] mb-[0.8%] flex items-center justify-between gap-[1%]">
+            <h3 className="text-[1.35vw] font-black uppercase tracking-wide truncate">
+              {categoryCards.length ? selectedCategory : 'Mais assistidos'}
+            </h3>
+            <span className="text-[0.82vw] text-white/70 shrink-0">{cards.length} cards</span>
+          </div>
 
-            <div
-              ref={cardsViewportRef}
-              className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden pr-[0.6%] pb-[1.2%] snap-y snap-mandatory"
-            >
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 items-start gap-x-[1.2%] gap-y-[1.2vh]">
-                {cards.map((chIdx) => renderChannelCard(chIdx, `grid-${chIdx}`))}
-              </div>
+          <div
+            ref={cardsViewportRef}
+            className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden pr-[0.6%] pb-[1.2%] snap-y snap-mandatory"
+          >
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 items-start gap-x-[1.2%] gap-y-[1.2vh]">
+              {cards.map((chIdx) => renderChannelCard(chIdx, `grid-${chIdx}`))}
             </div>
           </div>
         </section>
       </main>
 
       {expandedPlayback && expandedChannel && expandedItem && (
-        <div ref={fullscreenShellRef} className="fixed inset-0 z-50 bg-black" onClick={() => showExpandedInfo()}>
+        <div ref={fullscreenShellRef} className="fixed inset-0 z-50 bg-black" onMouseMove={showExpandedInfo} onMouseEnter={showExpandedInfo} onClick={showExpandedInfo}>
           <div className="absolute right-[1.2%] top-1/2 -translate-y-1/2 z-50 flex flex-col gap-[0.8%]">
             <button
               type="button"
@@ -2038,7 +1577,7 @@ const App: React.FC = () => {
             {expandedItem.type === ContentType.AD ? (
               <AdPlaceholder
                 duration={Math.max(0, expandedItem.duration - expandedPlayback.playback.offset)}
-                onEnded={closeExpanded}
+                onEnded={advanceExpandedPlayback}
               />
             ) : (
               <>
@@ -2048,14 +1587,14 @@ const App: React.FC = () => {
                     url={expandedItem.url!}
                     offset={expandedPlayerOffset}
                     duration={expandedItem.duration}
-                    onEnded={handleExpandedPlaybackEnded}
+                    onEnded={advanceExpandedPlayback}
                   />
                 ) : (
                   <HLSPlayer
                     key={`expanded-${expandedChannel.channel_id}-${expandedPlayback.playback.index}`}
                     url={expandedItem.url!}
                     offset={expandedPlayerOffset}
-                    onEnded={handleExpandedPlaybackEnded}
+                    onEnded={advanceExpandedPlayback}
                   />
                 )}
               </>
@@ -2086,9 +1625,30 @@ const App: React.FC = () => {
                       <div className="flex items-center gap-[0.6vw] shrink-0">
                         <button
                           type="button"
-                          onClick={(event) => {
+                          onMouseDown={(event) => {
+                            event.preventDefault();
                             event.stopPropagation();
-                            seekExpandedPlayback(-10);
+                            startSeekHold(-10);
+                          }}
+                          onMouseUp={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            endSeekHold(-10);
+                          }}
+                          onTouchStart={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            startSeekHold(-10);
+                          }}
+                          onTouchEnd={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            endSeekHold(-10);
+                          }}
+                          onTouchCancel={() => clearSeekHold()}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
                           }}
                           className="rounded-full border border-white/20 bg-black/55 px-[0.9vw] py-[0.45vw] text-[0.82vw] font-bold text-white/90 hover:bg-black/75"
                         >
@@ -2096,9 +1656,30 @@ const App: React.FC = () => {
                         </button>
                         <button
                           type="button"
-                          onClick={(event) => {
+                          onMouseDown={(event) => {
+                            event.preventDefault();
                             event.stopPropagation();
-                            seekExpandedPlayback(10);
+                            startSeekHold(10);
+                          }}
+                          onMouseUp={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            endSeekHold(10);
+                          }}
+                          onTouchStart={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            startSeekHold(10);
+                          }}
+                          onTouchEnd={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            endSeekHold(10);
+                          }}
+                          onTouchCancel={() => clearSeekHold()}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
                           }}
                           className="rounded-full border border-white/20 bg-black/55 px-[0.9vw] py-[0.45vw] text-[0.82vw] font-bold text-white/90 hover:bg-black/75"
                         >
@@ -2107,45 +1688,20 @@ const App: React.FC = () => {
                       </div>
                     )}
                   </div>
-                  {expandedItem.type === ContentType.VIDEO && (
-                    <>
-                      <div className="mt-[0.7vw] h-[0.45vw] rounded-full border border-cyan-300/50 bg-white/10 overflow-hidden">
-                        <div
-                          ref={expandedSeekBarRef}
-                          role="slider"
-                          aria-label="Progresso do video"
-                          aria-valuemin={0}
-                          aria-valuemax={Math.max(0, Math.floor(expandedMaxOffset))}
-                          aria-valuenow={Math.max(0, Math.floor(expandedEffectiveOffset))}
-                          className="relative h-full w-full cursor-ew-resize touch-none"
-                          onPointerDown={(event) => {
-                            event.stopPropagation();
-                            startExpandedSeekDrag(event.clientX);
-                          }}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            seekExpandedPlaybackToClientX(event.clientX);
-                          }}
-                        >
+                  {expandedItem.duration > 0 && (
+                    <div className="mt-[0.8vh]">
+                      <div className="overflow-hidden rounded-full border border-cyan-300/70 bg-white/10 p-[0.14vh] shadow-[0_0_0_0.08vw_rgba(34,211,238,0.25)] backdrop-blur-[2px]">
+                        <div className="h-[0.42vh] overflow-hidden rounded-full bg-white/15">
                           <div
-                            className="absolute inset-y-0 left-0 rounded-full bg-white/10"
-                            style={{ width: `${expandedLiveCapPercent}%` }}
-                          />
-                          <div
-                            className="absolute inset-y-0 left-0 rounded-full bg-[repeating-linear-gradient(135deg,rgba(34,211,238,0.95)_0px,rgba(34,211,238,0.95)_8px,rgba(255,255,255,0.6)_8px,rgba(255,255,255,0.6)_13px)] shadow-[0_0_18px_rgba(34,211,238,0.35)]"
-                            style={{ width: `${expandedProgressPercent}%` }}
-                          />
-                          <div
-                            className="absolute top-1/2 h-[0.95vw] w-[0.95vw] -translate-y-1/2 rounded-full border border-cyan-200/80 bg-cyan-300 shadow-[0_0_14px_rgba(34,211,238,0.45)]"
-                            style={{ left: `calc(${expandedProgressPercent}% - 0.48vw)` }}
+                            className="h-full rounded-full bg-[repeating-linear-gradient(135deg,rgba(34,211,238,0.96)_0,rgba(34,211,238,0.96)_0.38vw,rgba(255,255,255,0.26)_0.38vw,rgba(255,255,255,0.26)_0.58vw)] shadow-[0_0_0.85vw_rgba(34,211,238,0.35)]"
+                            style={{ width: `${expandedProgress.percent}%` }}
                           />
                         </div>
                       </div>
-                      <div className="mt-[0.45vw] flex items-center justify-between text-[0.75vw] text-white/75 tabular-nums">
-                        <span>{formatPlaybackClock(expandedEffectiveOffset)}</span>
-                        <span>{formatPlaybackClock(expandedDuration)}</span>
+                      <div className="mt-[0.35vh] text-[0.72vw] text-cyan-50/82">
+                        {expandedProgress.elapsedLabel} / {expandedProgress.durationLabel}
                       </div>
-                    </>
+                    </div>
                   )}
                 </div>
               </div>
@@ -2158,12 +1714,6 @@ const App: React.FC = () => {
 };
 
 export default App;
-
-
-
-
-
-
 
 
 

@@ -4,7 +4,6 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', '');
-  const edgeTarget = env.EDGE_PROXY_TARGET || env.VITE_EDGE_FALLBACK_BASE_URL || 'http://103.45.245.32:8080';
 
   const proxy: Record<string, any> = {
     '/resolve': {
@@ -18,13 +17,8 @@ export default defineConfig(({ mode }) => {
       rewrite: (p) => p.replace(/^\/playlist$/, '/playlist.m3u'),
     },
     '/playlist.json': {
-      target: edgeTarget,
+      target: 'http://103.45.245.32:8080',
       changeOrigin: true,
-    },
-    '/edge': {
-      target: edgeTarget,
-      changeOrigin: true,
-      rewrite: (p: string) => p.replace(/^\/edge/, ''),
     },
     '/central-media': {
       target: 'http://207.126.162.189:9000',
@@ -40,8 +34,6 @@ export default defineConfig(({ mode }) => {
       allowedHosts: [
         'wiipyn.com',
         'www.wiipyn.com',
-        'nexcast.tv',
-        'www.nexcast.tv',
         '103.45.245.116',
       ],
       proxy,
